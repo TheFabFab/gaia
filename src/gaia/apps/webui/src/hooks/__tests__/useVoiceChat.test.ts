@@ -68,6 +68,26 @@ beforeEach(() => {
     wsInstances.length = 0;
     vi.stubGlobal('WebSocket', MockWebSocket);
     vi.useFakeTimers();
+
+    // AudioContext mock — needed because useVoiceChat now calls useAudioPlayback
+    // which lazily constructs an AudioContext when binary frames arrive.
+    const mockAudioBuffer = { duration: 0.1, length: 160, numberOfChannels: 1, sampleRate: 24000 };
+    const mockSourceNode = {
+        buffer: null as AudioBuffer | null,
+        onended: null as (() => void) | null,
+        start: vi.fn(),
+        stop: vi.fn(),
+        connect: vi.fn(),
+    };
+    const mockAudioCtx = {
+        state: 'running' as AudioContextState,
+        destination: {},
+        resume: vi.fn().mockResolvedValue(undefined),
+        decodeAudioData: vi.fn().mockResolvedValue(mockAudioBuffer),
+        createBufferSource: vi.fn().mockReturnValue(mockSourceNode),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    vi.stubGlobal('AudioContext', vi.fn().mockImplementation(function(this: any) { return mockAudioCtx; }));
 });
 
 afterEach(() => {
@@ -193,5 +213,61 @@ describe('useVoiceChat', () => {
         });
 
         expect(result.current.error).toBeTruthy();
+    });
+
+    it('parses transcript messages and calls onTranscript callback', async () => {
+        const onTranscript = vi.fn();
+        const { result } = renderHook(() => useVoiceChat({ onTranscript }));
+
+        act(() => {
+            latestWs().simulateOpen();
+            latestWs().simulateMessage({ type: 'transcript', text: 'Hello world' });
+        });
+
+        expect(onTranscript).toHaveBeenCalledWith('Hello world');
+        // result.current should still be connected
+        expect(result.current.isConnected).toBe(true);
+    });
+
+    it('parses response messages and calls onResponse callback', async () => {
+        const onResponse = vi.fn();
+        const { result } = renderHook(() => useVoiceChat({ onResponse }));
+
+        act(() => {
+            latestWs().simulateOpen();
+            latestWs().simulateMessage({ type: 'response', text: 'Hi there!' });
+        });
+
+        expect(onResponse).toHaveBeenCalledWith('Hi there!');
+        expect(result.current.isConnected).toBe(true);
+    });
+
+    it('routes binary WebSocket frames to onTtsAudio callback', async () => {
+        const onTtsAudio = vi.fn();
+        renderHook(() => useVoiceChat({ onTtsAudio }));
+
+        const audioData = new ArrayBuffer(512);
+        await act(async () => {
+            latestWs().simulateOpen();
+            latestWs().simulateBinaryMessage(audioData);
+        });
+
+        expect(onTtsAudio).toHaveBeenCalledWith(audioData);
+    });
+
+    it('sends interrupt JSON message when interrupt() is called', async () => {
+        const { result } = renderHook(() => useVoiceChat({}));
+
+        act(() => {
+            latestWs().simulateOpen();
+        });
+
+        act(() => {
+            result.current.interrupt();
+        });
+
+        expect(latestWs().send).toHaveBeenCalledWith(
+            JSON.stringify({ type: 'interrupt' })
+        );
     });
 });

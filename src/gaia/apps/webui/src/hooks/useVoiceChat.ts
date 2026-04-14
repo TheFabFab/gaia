@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { useAudioPlayback } from './useAudioPlayback';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -109,6 +110,8 @@ export function useVoiceChat(options: UseVoiceChatOptions): UseVoiceChatResult {
     const [isConnected, setIsConnected] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
+    const audioPlayback = useAudioPlayback();
+
     const wsRef = useRef<WebSocket | null>(null);
     const backoffRef = useRef(BACKOFF_INITIAL_MS);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -165,6 +168,7 @@ export function useVoiceChat(options: UseVoiceChatOptions): UseVoiceChatResult {
             // Binary frame → TTS audio
             if (ev.data instanceof ArrayBuffer) {
                 onTtsAudioRef.current?.(ev.data);
+                void audioPlayback.queueAudio(ev.data);
                 return;
             }
             if (typeof ev.data !== 'string') return;
@@ -265,11 +269,13 @@ export function useVoiceChat(options: UseVoiceChatOptions): UseVoiceChatResult {
     }, []);
 
     /**
-     * Sends an `interrupt` message to cancel ongoing TTS playback on the server.
+     * Stops local TTS playback immediately and sends an `interrupt` message
+     * to cancel ongoing TTS streaming on the server.
      */
     const interrupt = useCallback(() => {
+        audioPlayback.interrupt();
         wsRef.current?.send(JSON.stringify({ type: 'interrupt' }));
-    }, []);
+    }, [audioPlayback]);
 
     return { capabilities, isConnected, start, stop, sendAudio, interrupt, error };
 }
