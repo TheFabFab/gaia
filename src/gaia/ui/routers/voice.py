@@ -1,13 +1,14 @@
 # Copyright(C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Voice capability detection, status endpoint, and WebSocket ASR streaming.
+"""Voice capability detection, status endpoint, and WebSocket ASR/TTS streaming.
 
 Provides:
 - ``GET /api/voice/status`` — queries Lemonade for available ASR/TTS models.
 - ``WS /api/voice/stream`` — WebSocket endpoint that accepts binary PCM audio
-  from the browser, forwards it to Lemonade's realtime ASR WebSocket, and
-  returns transcript JSON back to the client.
+  from the browser, forwards it to Lemonade's realtime ASR WebSocket,
+  returns transcript JSON, calls LLM for a response, and streams TTS
+  audio back to the client.
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import base64
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -108,6 +110,38 @@ async def _lemonade_get(path: str, *, timeout: float = 5.0) -> httpx.Response:
         return await client.get(url)
 
 
+async def _lemonade_post(
+    path: str, *, json_data: dict[str, Any] | None = None, timeout: float = 30.0
+) -> httpx.Response:
+    """Send an async POST request to the Lemonade voice server.
+
+    Args:
+        path: URL path (will be appended to the base URL).
+        json_data: JSON body to include in the request.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        The ``httpx.Response`` object.
+    """
+    base_url = _get_lemonade_voice_base_url()
+    url = f"{base_url}{path}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(url, json=json_data)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences at common boundary punctuation.
+
+    Args:
+        text: Input text to split.
+
+    Returns:
+        List of non-empty sentence strings.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [s for s in sentences if s.strip()]
+
+
 # ── Endpoint ─────────────────────────────────────────────────────────────
 
 
@@ -177,6 +211,142 @@ async def _fetch_voice_status() -> VoiceStatusResponse:
     return VoiceStatusResponse(asr=asr, tts=tts)
 
 
+# ── LLM + TTS processing ────────────────────────────────────────────────
+
+
+async def _process_llm_and_tts(
+    transcript: str,
+    conversation_history: list[dict[str, str]],
+    client_ws: WebSocket,
+    cancel_event: asyncio.Event,
+    db: Any | None,
+    session_state: dict[str, Any],
+) -> None:
+    """Call LLM chat completions with transcript, then stream TTS audio.
+
+    Sends ``response`` JSON with LLM text, followed by ``tts_start``,
+    binary PCM audio frames (one per sentence), and ``tts_end``.
+
+    Uses sentence-splitting for pseudo-streaming TTS (DR-003).
+
+    Args:
+        transcript: The user's spoken text from ASR.
+        conversation_history: Mutable list of chat messages for context.
+        client_ws: The browser-facing WebSocket to send messages on.
+        cancel_event: Set by interrupt handler to abort TTS streaming.
+        db: ChatDatabase instance for persisting messages (may be None).
+        session_state: Mutable dict holding ``voice_session_id``.
+    """
+    conversation_history.append({"role": "user", "content": transcript})
+
+    # Persist user message
+    if db:
+        try:
+            if not session_state.get("voice_session_id"):
+                session = db.create_session(
+                    title="Voice Conversation", agent_type="voice"
+                )
+                session_state["voice_session_id"] = session["id"]
+            db.add_message(
+                session_state["voice_session_id"], "user", transcript
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist voice message: %s", exc)
+
+    # Call LLM
+    try:
+        response = await _lemonade_post(
+            "/v1/chat/completions",
+            json_data={"messages": conversation_history},
+        )
+        if response.status_code != 200:
+            try:
+                await client_ws.send_json({
+                    "type": "error",
+                    "message": "LLM request failed",
+                })
+            except Exception:
+                pass
+            return
+        llm_data = response.json()
+        llm_text = llm_data["choices"][0]["message"]["content"]
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        try:
+            await client_ws.send_json({
+                "type": "error",
+                "message": f"LLM error: {exc}",
+            })
+        except Exception:
+            pass
+        return
+
+    conversation_history.append({"role": "assistant", "content": llm_text})
+    await client_ws.send_json({"type": "response", "text": llm_text})
+
+    # Persist assistant message
+    if db:
+        try:
+            db.add_message(
+                session_state["voice_session_id"], "assistant", llm_text
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist voice response: %s", exc)
+
+    if cancel_event.is_set():
+        return
+
+    # TTS streaming (sentence-by-sentence per DR-003)
+    sentences = _split_sentences(llm_text)
+    tts_started = False
+
+    try:
+        await client_ws.send_json({"type": "tts_start"})
+        tts_started = True
+
+        for sentence in sentences:
+            if cancel_event.is_set():
+                break
+
+            try:
+                tts_response = await _lemonade_post(
+                    "/api/v1/audio/speech",
+                    json_data={
+                        "model": "kokoro-v1",
+                        "input": sentence.strip(),
+                        "voice": "af_heart",
+                        "response_format": "pcm",
+                        "speed": 1.0,
+                    },
+                    timeout=60.0,
+                )
+                if cancel_event.is_set():
+                    break
+                if tts_response.status_code == 200 and tts_response.content:
+                    await client_ws.send_bytes(tts_response.content)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("TTS error for sentence: %s", exc)
+                try:
+                    await client_ws.send_json({
+                        "type": "error",
+                        "message": f"TTS error: {exc}",
+                    })
+                except Exception:
+                    pass
+                break
+    except asyncio.CancelledError:
+        pass  # Interrupted — finally block handles tts_end
+    finally:
+        if tts_started:
+            try:
+                await client_ws.send_json({"type": "tts_end"})
+            except Exception:
+                pass  # Client may have disconnected
+
+
 # ── WebSocket ASR streaming endpoint ────────────────────────────────────
 
 
@@ -184,6 +354,7 @@ async def _listen_lemonade(
     lemonade_ws: Any,
     client_ws: WebSocket,
     stop_event: asyncio.Event,
+    transcript_queue: asyncio.Queue[str] | None = None,
 ) -> None:
     """Forward transcript events from Lemonade ASR to the browser client.
 
@@ -195,6 +366,8 @@ async def _listen_lemonade(
         lemonade_ws: The open WebSocket connection to Lemonade ASR.
         client_ws: The browser-facing FastAPI WebSocket.
         stop_event: Signals this listener to stop.
+        transcript_queue: Optional queue to provide transcripts to the
+            stop handler for LLM+TTS processing.
     """
     try:
         while not stop_event.is_set():
@@ -230,13 +403,15 @@ async def _listen_lemonade(
                     "type": "transcript",
                     "text": transcript,
                 })
+                if transcript_queue is not None:
+                    await transcript_queue.put(transcript)
     except Exception as exc:
         logger.debug("Lemonade listener stopped: %s", exc)
 
 
 @router.websocket("/api/voice/stream")
 async def voice_stream(ws: WebSocket) -> None:
-    """WebSocket endpoint for realtime voice ASR streaming.
+    """WebSocket endpoint for realtime voice interaction.
 
     Protocol:
     - On connect: sends a ``status`` JSON message with ASR/TTS availability.
@@ -244,8 +419,13 @@ async def voice_stream(ws: WebSocket) -> None:
     - Client sends binary PCM frames (16-bit, 16 kHz, mono).
     - Server forwards audio to Lemonade ASR WebSocket (base64-encoded).
     - Server sends ``{"type": "transcript", "text": "..."}`` on transcription.
-    - Client sends ``{"type": "stop"}`` to end ASR session.
-    - On disconnect: cleans up all Lemonade WebSocket resources.
+    - Client sends ``{"type": "stop"}`` to end ASR session and trigger LLM+TTS.
+    - Server sends ``{"type": "response", "text": "..."}`` with LLM response.
+    - Server sends ``{"type": "tts_start"}`` before TTS audio.
+    - Server sends binary PCM frames (24 kHz, 16-bit mono) for TTS audio.
+    - Server sends ``{"type": "tts_end"}`` after TTS audio completes.
+    - Client sends ``{"type": "interrupt"}`` to cancel active TTS streaming.
+    - On disconnect: cleans up all resources.
 
     Args:
         ws: The incoming FastAPI WebSocket connection.
@@ -262,12 +442,30 @@ async def voice_stream(ws: WebSocket) -> None:
 
     lemonade_ws: Any | None = None
     listener_task: asyncio.Task[None] | None = None
+    llm_tts_task: asyncio.Task[None] | None = None
     stop_event = asyncio.Event()
+    tts_cancel_event = asyncio.Event()
+    transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+    conversation_history: list[dict[str, str]] = []
+    session_state: dict[str, Any] = {"voice_session_id": None}
+
+    # Access database for chat history persistence
+    db: Any | None = getattr(getattr(ws, "app", None), "state", None)
+    if db is not None:
+        db = getattr(db, "db", None)
 
     async def _cleanup() -> None:
-        """Close Lemonade WebSocket and cancel listener task."""
-        nonlocal lemonade_ws, listener_task
+        """Close Lemonade WebSocket and cancel background tasks."""
+        nonlocal lemonade_ws, listener_task, llm_tts_task
         stop_event.set()
+        tts_cancel_event.set()
+        if llm_tts_task and not llm_tts_task.done():
+            llm_tts_task.cancel()
+            try:
+                await llm_tts_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            llm_tts_task = None
         if listener_task and not listener_task.done():
             listener_task.cancel()
             try:
@@ -324,8 +522,11 @@ async def voice_stream(ws: WebSocket) -> None:
                     try:
                         lemonade_ws = await websockets.connect(lemonade_url)
                         stop_event.clear()
+                        tts_cancel_event.clear()
                         listener_task = asyncio.create_task(
-                            _listen_lemonade(lemonade_ws, ws, stop_event)
+                            _listen_lemonade(
+                                lemonade_ws, ws, stop_event, transcript_queue
+                            )
                         )
                     except Exception as exc:
                         logger.warning(
@@ -337,7 +538,7 @@ async def voice_stream(ws: WebSocket) -> None:
                         })
 
                 elif msg_type == "stop":
-                    # Commit audio buffer and wait for transcript before closing
+                    # Commit audio buffer and wait for transcript
                     if lemonade_ws:
                         try:
                             await lemonade_ws.send(
@@ -350,6 +551,37 @@ async def voice_stream(ws: WebSocket) -> None:
                                 "Failed to commit audio buffer: %s", exc
                             )
                     await _cleanup()
+
+                    # Start LLM+TTS if a transcript was received
+                    try:
+                        last_transcript = transcript_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        last_transcript = None
+
+                    if last_transcript:
+                        tts_cancel_event.clear()
+                        llm_tts_task = asyncio.create_task(
+                            _process_llm_and_tts(
+                                last_transcript,
+                                conversation_history,
+                                ws,
+                                tts_cancel_event,
+                                db,
+                                session_state,
+                            )
+                        )
+
+                elif msg_type == "interrupt":
+                    # Cancel active TTS streaming
+                    tts_cancel_event.set()
+                    if llm_tts_task and not llm_tts_task.done():
+                        llm_tts_task.cancel()
+                        try:
+                            await llm_tts_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        llm_tts_task = None
+                    tts_cancel_event.clear()
 
     except WebSocketDisconnect:
         pass

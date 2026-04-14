@@ -3,7 +3,8 @@
 
 """Component tests for WS /api/voice/stream endpoint.
 
-PRD-116 Task 2 — Verifies WebSocket ASR integration with Lemonade realtime.
+PRD-116 Tasks 2 & 3 — Verifies WebSocket ASR integration with Lemonade
+realtime, LLM chat completions, and TTS audio streaming.
 
 Tests mock the Lemonade WebSocket and HTTP calls so they run without
 a live Lemonade instance.
@@ -331,4 +332,352 @@ class TestVoiceWebSocketAsr:
         time.sleep(0.3)
 
         # Lemonade WS should be cleaned up
+        assert fake_ws.closed is True
+
+
+# ── Task 3: LLM + TTS streaming tests ───────────────────────────────────
+
+
+def _make_lemonade_post_mock(
+    llm_text: str = "Das ist eine Antwort.",
+    tts_audio: bytes = b"\x00\x01" * 100,
+    llm_fail: bool = False,
+    tts_fail: bool = False,
+):
+    """Create a mock for _lemonade_post returning configured LLM/TTS responses."""
+
+    async def fake_post(path: str, **kwargs):
+        if "chat/completions" in path:
+            if llm_fail:
+                raise httpx.ConnectError("LLM unreachable")
+            return _mock_httpx_response(200, {
+                "choices": [{"message": {"content": llm_text}}],
+            })
+        if "audio/speech" in path:
+            if tts_fail:
+                raise httpx.ConnectError("TTS unreachable")
+            return httpx.Response(200, content=tts_audio)
+        raise ValueError(f"Unexpected POST path: {path}")
+
+    return fake_post
+
+
+def _make_asr_transcript_ws(transcript: str = "Hallo Welt"):
+    """Create a FakeLemonadeWs that returns session.created then transcript."""
+    return FakeLemonadeWs(responses=[
+        json.dumps({"type": "session.created", "session": {"id": "s1"}}),
+        json.dumps({"type": "input_audio_buffer.committed"}),
+        json.dumps({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": transcript,
+        }),
+    ])
+
+
+class TestVoiceWebSocketLlmTts:
+    """Tests for LLM response and TTS audio streaming after transcript (Task 3)."""
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_llm_response_sent_after_transcript(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """LLM response is sent after transcript is complete."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        transcript = "Was ist KPG?"
+        llm_text = "KPG steht für Kooperative Prozessgestaltung."
+        fake_ws = _make_asr_transcript_ws(transcript)
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+        mock_post.side_effect = _make_lemonade_post_mock(llm_text=llm_text)
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            time.sleep(0.1)
+            ws.send_json({"type": "stop"})
+
+            # Should receive transcript
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "transcript"
+            assert msg["text"] == transcript
+
+            # Should receive LLM response
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "response"
+            assert msg["text"] == llm_text
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_tts_audio_frames_sent_after_llm_response(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """TTS audio binary frames are sent after LLM response."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        tts_audio = b"\xAB\xCD" * 200
+        fake_ws = _make_asr_transcript_ws("Test")
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+        mock_post.side_effect = _make_lemonade_post_mock(
+            llm_text="Kurze Antwort.", tts_audio=tts_audio
+        )
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_json({"type": "stop"})
+
+            ws.receive_json(mode="text")  # transcript
+            ws.receive_json(mode="text")  # response
+
+            # Should receive tts_start, binary audio, tts_end
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "tts_start"
+
+            audio_data = ws.receive_bytes()
+            assert len(audio_data) > 0
+
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "tts_end"
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_tts_start_and_end_bracket_audio(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """tts_start and tts_end control messages bracket TTS audio."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        tts_audio = b"\x01\x02" * 50
+        fake_ws = _make_asr_transcript_ws("Hallo")
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+        mock_post.side_effect = _make_lemonade_post_mock(
+            llm_text="Antwort.", tts_audio=tts_audio
+        )
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_json({"type": "stop"})
+
+            ws.receive_json(mode="text")  # transcript
+            ws.receive_json(mode="text")  # response
+
+            # First message must be tts_start
+            msg = ws.receive_json(mode="text")
+            assert msg == {"type": "tts_start"}
+
+            # Then at least one binary audio frame
+            audio = ws.receive_bytes()
+            assert len(audio) > 0
+
+            # Then tts_end
+            msg = ws.receive_json(mode="text")
+            assert msg == {"type": "tts_end"}
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_interrupt_stops_tts_streaming(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """Interrupt message stops TTS streaming immediately."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        # Use multi-sentence text and slow TTS to give time for interrupt
+        llm_text = "Erste Antwort. Zweite Antwort. Dritte Antwort. Vierte Antwort."
+        tts_audio = b"\x00\x01" * 500
+
+        # Make TTS slightly slow so interrupt can fire between sentences
+        call_count = 0
+
+        async def slow_post(path: str, **kwargs):
+            nonlocal call_count
+            if "chat/completions" in path:
+                return _mock_httpx_response(200, {
+                    "choices": [{"message": {"content": llm_text}}],
+                })
+            if "audio/speech" in path:
+                call_count += 1
+                await asyncio.sleep(0.1)  # Simulate TTS latency
+                return httpx.Response(200, content=tts_audio)
+            raise ValueError(f"Unexpected POST path: {path}")
+
+        mock_post.side_effect = slow_post
+
+        fake_ws = _make_asr_transcript_ws("Test Interrupt")
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_json({"type": "stop"})
+
+            ws.receive_json(mode="text")  # transcript
+            ws.receive_json(mode="text")  # response
+            ws.receive_json(mode="text")  # tts_start
+
+            # Receive first audio chunk then send interrupt
+            ws.receive_bytes()
+            ws.send_json({"type": "interrupt"})
+
+            # Should receive tts_end (interrupt acknowledged)
+            time.sleep(0.3)
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "tts_end"
+
+        # Should NOT have processed all 4 sentences
+        assert call_count < 4
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_error_on_tts_failure(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """Error message sent when Lemonade TTS request fails."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        fake_ws = _make_asr_transcript_ws("Test TTS Fehler")
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+        mock_post.side_effect = _make_lemonade_post_mock(
+            llm_text="Antwort.", tts_fail=True
+        )
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_json({"type": "stop"})
+
+            ws.receive_json(mode="text")  # transcript
+            ws.receive_json(mode="text")  # response
+            ws.receive_json(mode="text")  # tts_start
+
+            # Should receive error about TTS failure
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "error"
+            assert "tts" in msg.get("message", "").lower()
+
+            # Should still get tts_end
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "tts_end"
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_error_on_llm_failure(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """Error message sent when Lemonade LLM request fails."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        fake_ws = _make_asr_transcript_ws("Test LLM Fehler")
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+        mock_post.side_effect = _make_lemonade_post_mock(llm_fail=True)
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_json({"type": "stop"})
+
+            ws.receive_json(mode="text")  # transcript
+
+            # Should receive error about LLM failure
+            msg = ws.receive_json(mode="text")
+            assert msg["type"] == "error"
+            assert "llm" in msg.get("message", "").lower()
+
+    @patch("gaia.ui.routers.voice._lemonade_post")
+    @patch("gaia.ui.routers.voice.websockets")
+    @patch("gaia.ui.routers.voice._lemonade_get")
+    def test_client_disconnect_during_tts_cleans_up(
+        self, mock_get, mock_ws_lib, mock_post, client
+    ):
+        """Client disconnect during TTS does not leak resources."""
+        mock_get.side_effect = _make_lemonade_get_mock()
+
+        llm_text = "Erste. Zweite. Dritte. Vierte. Fünfte."
+        tts_audio = b"\x00\x01" * 500
+
+        async def slow_post(path: str, **kwargs):
+            if "chat/completions" in path:
+                return _mock_httpx_response(200, {
+                    "choices": [{"message": {"content": llm_text}}],
+                })
+            if "audio/speech" in path:
+                await asyncio.sleep(0.2)  # Slow TTS
+                return httpx.Response(200, content=tts_audio)
+            raise ValueError(f"Unexpected POST path: {path}")
+
+        mock_post.side_effect = slow_post
+
+        fake_ws = _make_asr_transcript_ws("Test Disconnect")
+
+        async def fake_connect(url, **kwargs):
+            return fake_ws
+
+        mock_ws_lib.connect = AsyncMock(side_effect=fake_connect)
+
+        with client.websocket_connect("/api/voice/stream") as ws:
+            ws.receive_json()  # status
+            ws.send_json({"type": "start", "model": "Whisper-Tiny-en"})
+            import time
+            time.sleep(0.2)
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_json({"type": "stop"})
+
+            ws.receive_json(mode="text")  # transcript
+            ws.receive_json(mode="text")  # response
+            # Client disconnects during TTS (before audio completes)
+
+        # Give async cleanup time
+        import time
+        time.sleep(0.5)
+
+        # Resources should be cleaned up
         assert fake_ws.closed is True
