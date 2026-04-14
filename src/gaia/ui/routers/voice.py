@@ -1,19 +1,25 @@
 # Copyright(C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Voice capability detection and status endpoint.
+"""Voice capability detection, status endpoint, and WebSocket ASR streaming.
 
-Provides ``GET /api/voice/status`` which queries the Lemonade server for
-available ASR (speech-to-text) and TTS (text-to-speech) models and returns
-a structured capability summary for the frontend.
+Provides:
+- ``GET /api/voice/status`` — queries Lemonade for available ASR/TTS models.
+- ``WS /api/voice/stream`` — WebSocket endpoint that accepts binary PCM audio
+  from the browser, forwards it to Lemonade's realtime ASR WebSocket, and
+  returns transcript JSON back to the client.
 """
 
+import asyncio
+import base64
+import json
 import logging
 import os
 from typing import Any
 
 import httpx
-from fastapi import APIRouter
+import websockets
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -116,6 +122,21 @@ async def voice_status() -> VoiceStatusResponse:
     Returns:
         VoiceStatusResponse with ASR and TTS availability info.
     """
+    return await _fetch_voice_status()
+
+
+# ── Internal helpers for voice status (shared with WebSocket) ────────────
+
+
+async def _fetch_voice_status() -> VoiceStatusResponse:
+    """Fetch current ASR/TTS capability status from Lemonade.
+
+    Shared between the REST endpoint and WebSocket on-connect status
+    message so both return identical data.
+
+    Returns:
+        VoiceStatusResponse with current availability info.
+    """
     try:
         health_resp = await _lemonade_get("/api/v1/health")
         models_resp = await _lemonade_get("/v1/models")
@@ -124,11 +145,6 @@ async def voice_status() -> VoiceStatusResponse:
         return VoiceStatusResponse()
 
     if health_resp.status_code != 200 or models_resp.status_code != 200:
-        logger.warning(
-            "Lemonade voice server returned non-200: health=%d models=%d",
-            health_resp.status_code,
-            models_resp.status_code,
-        )
         return VoiceStatusResponse()
 
     health_data: dict[str, Any] = health_resp.json()
@@ -136,7 +152,6 @@ async def voice_status() -> VoiceStatusResponse:
 
     websocket_port: int | None = health_data.get("websocket_port")
 
-    # Build model lists filtered by recipe
     asr_models: list[VoiceModelInfo] = []
     tts_models: list[VoiceModelInfo] = []
 
@@ -154,11 +169,191 @@ async def voice_status() -> VoiceStatusResponse:
         defaultModel=asr_models[0].name if asr_models else None,
         websocketPort=websocket_port if asr_models else None,
     )
-
     tts = TtsStatus(
         available=len(tts_models) > 0,
         models=tts_models,
         defaultModel=tts_models[0].name if tts_models else None,
     )
-
     return VoiceStatusResponse(asr=asr, tts=tts)
+
+
+# ── WebSocket ASR streaming endpoint ────────────────────────────────────
+
+
+async def _listen_lemonade(
+    lemonade_ws: Any,
+    client_ws: WebSocket,
+    stop_event: asyncio.Event,
+) -> None:
+    """Forward transcript events from Lemonade ASR to the browser client.
+
+    Runs as a background task, listening for messages from the Lemonade
+    realtime WebSocket and forwarding relevant transcript events to the
+    browser WebSocket.
+
+    Args:
+        lemonade_ws: The open WebSocket connection to Lemonade ASR.
+        client_ws: The browser-facing FastAPI WebSocket.
+        stop_event: Signals this listener to stop.
+    """
+    try:
+        while not stop_event.is_set():
+            try:
+                raw = await asyncio.wait_for(lemonade_ws.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = msg.get("type", "")
+
+            if msg_type == "session.created":
+                # Send session.update with German language config
+                update_msg = {
+                    "type": "session.update",
+                    "session": {
+                        "input_audio_transcription": {
+                            "language": "de",
+                        }
+                    },
+                }
+                await lemonade_ws.send(json.dumps(update_msg))
+
+            elif msg_type == "conversation.item.input_audio_transcription.completed":
+                transcript = msg.get("transcript", "")
+                await client_ws.send_json({
+                    "type": "transcript",
+                    "text": transcript,
+                })
+    except Exception as exc:
+        logger.debug("Lemonade listener stopped: %s", exc)
+
+
+@router.websocket("/api/voice/stream")
+async def voice_stream(ws: WebSocket) -> None:
+    """WebSocket endpoint for realtime voice ASR streaming.
+
+    Protocol:
+    - On connect: sends a ``status`` JSON message with ASR/TTS availability.
+    - Client sends ``{"type": "start", "model": "..."}`` to begin ASR.
+    - Client sends binary PCM frames (16-bit, 16 kHz, mono).
+    - Server forwards audio to Lemonade ASR WebSocket (base64-encoded).
+    - Server sends ``{"type": "transcript", "text": "..."}`` on transcription.
+    - Client sends ``{"type": "stop"}`` to end ASR session.
+    - On disconnect: cleans up all Lemonade WebSocket resources.
+
+    Args:
+        ws: The incoming FastAPI WebSocket connection.
+    """
+    await ws.accept()
+
+    # Send initial status to client
+    status = await _fetch_voice_status()
+    await ws.send_json({
+        "type": "status",
+        "asr": status.asr.model_dump(),
+        "tts": status.tts.model_dump(),
+    })
+
+    lemonade_ws: Any | None = None
+    listener_task: asyncio.Task[None] | None = None
+    stop_event = asyncio.Event()
+
+    async def _cleanup() -> None:
+        """Close Lemonade WebSocket and cancel listener task."""
+        nonlocal lemonade_ws, listener_task
+        stop_event.set()
+        if listener_task and not listener_task.done():
+            listener_task.cancel()
+            try:
+                await listener_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            listener_task = None
+        if lemonade_ws:
+            try:
+                await lemonade_ws.close()
+            except Exception:
+                pass
+            lemonade_ws = None
+
+    try:
+        while True:
+            message = await ws.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            # Binary PCM frame from browser
+            if "bytes" in message and message["bytes"] is not None:
+                if lemonade_ws:
+                    pcm_data = message["bytes"]
+                    audio_b64 = base64.b64encode(pcm_data).decode("ascii")
+                    append_msg = json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": audio_b64,
+                    })
+                    try:
+                        await lemonade_ws.send(append_msg)
+                    except Exception as exc:
+                        logger.warning("Failed to forward audio to Lemonade: %s", exc)
+                continue
+
+            # JSON text message from browser
+            if "text" in message and message["text"] is not None:
+                try:
+                    data = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type", "")
+
+                if msg_type == "start":
+                    # Open Lemonade ASR WebSocket
+                    model = data.get("model", "")
+                    ws_port = status.asr.websocketPort or 9000
+                    lemonade_url = (
+                        f"ws://127.0.0.1:{ws_port}/realtime?model={model}"
+                    )
+
+                    try:
+                        lemonade_ws = await websockets.connect(lemonade_url)
+                        stop_event.clear()
+                        listener_task = asyncio.create_task(
+                            _listen_lemonade(lemonade_ws, ws, stop_event)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to connect to Lemonade ASR: %s", exc
+                        )
+                        await ws.send_json({
+                            "type": "error",
+                            "message": f"ASR connection failed: {exc}",
+                        })
+
+                elif msg_type == "stop":
+                    # Commit audio buffer and wait for transcript before closing
+                    if lemonade_ws:
+                        try:
+                            await lemonade_ws.send(
+                                json.dumps({"type": "input_audio_buffer.commit"})
+                            )
+                            # Give listener time to receive the transcript
+                            await asyncio.sleep(0.5)
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to commit audio buffer: %s", exc
+                            )
+                    await _cleanup()
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("Voice WebSocket error: %s", exc)
+    finally:
+        await _cleanup()
