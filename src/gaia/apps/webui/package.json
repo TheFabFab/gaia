@@ -49,6 +49,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "start": "electron .",
     "package": "npm run build && electron-builder --config electron-builder.yml",
     "package:win": "npm run build && electron-builder --win --config electron-builder.yml",
@@ -60,11 +62,16 @@
     "electron-updater": "^6.8.3"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.2.18",
     "@vitejs/plugin-react": "^4.2.1",
+    "@vitest/coverage-v8": "^4.1.4",
     "electron": "^40.6.1",
     "electron-builder": "^26.8.1",
+    "jsdom": "^29.0.2",
     "lucide-react": "^0.312.0",
     "qrcode": "^1.5.4",
     "react": "^18.2.0",
@@ -75,6 +82,7 @@
     "remark-gfm": "^4.0.1",
     "typescript": "^5.3.3",
     "vite": "^5.0.12",
+    "vitest": "^4.1.4",
     "zustand": "^4.5.0"
   }
 }

@@ -1,0 +1,48 @@
+/* Copyright(C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved. */
+/* SPDX-License-Identifier: MIT */
+
+.voice-activity-indicator {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 20px;
+    padding: 0 4px;
+}
+
+.voice-activity-indicator__bar {
+    width: 3px;
+    border-radius: 2px;
+    background: var(--accent, #6366f1);
+    animation: voice-wave 1.2s ease-in-out infinite;
+    transform-origin: bottom;
+}
+
+.voice-activity-indicator__bar:nth-child(1) {
+    height: 40%;
+    animation-delay: 0s;
+}
+
+.voice-activity-indicator__bar:nth-child(2) {
+    height: 70%;
+    animation-delay: 0.15s;
+}
+
+.voice-activity-indicator__bar:nth-child(3) {
+    height: 100%;
+    animation-delay: 0.3s;
+}
+
+.voice-activity-indicator__bar:nth-child(4) {
+    height: 70%;
+    animation-delay: 0.45s;
+}
+
+.voice-activity-indicator__bar:nth-child(5) {
+    height: 40%;
+    animation-delay: 0.6s;
+}
+
+@keyframes voice-wave {
+    0%, 100% { transform: scaleY(0.4); opacity: 0.6; }
+    50%       { transform: scaleY(1);   opacity: 1;   }
+}

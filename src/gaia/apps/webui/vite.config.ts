@@ -31,6 +31,11 @@ export default defineConfig({
     define: {
         __APP_VERSION__: JSON.stringify(gaiaVersion),
     },
+    test: {
+        globals: true,
+        environment: 'jsdom',
+        setupFiles: ['./src/test/setup.ts'],
+    },
     server: {
         port: 5174,
         proxy: {
