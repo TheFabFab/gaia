@@ -55,6 +55,7 @@ from .routers import mcp as mcp_router_mod
 from .routers import sessions as sessions_router_mod
 from .routers import system as system_router_mod
 from .routers import tunnel as tunnel_router_mod
+from .routers import voice as voice_router_mod
 from .tunnel import TunnelManager
 from .utils import ALLOWED_EXTENSIONS as _ALLOWED_EXTENSIONS  # noqa: F401
 from .utils import compute_file_hash as _compute_file_hash  # noqa: F401
@@ -346,6 +347,7 @@ def create_app(db_path: str = None, webui_dist: str = None) -> FastAPI:
     app.include_router(files_router_mod.router)
     app.include_router(tunnel_router_mod.router)
     app.include_router(mcp_router_mod.router)
+    app.include_router(voice_router_mod.router)
 
     # ── Serve Uploaded Files ─────────────────────────────────────────────
     # Mount the uploads directory so uploaded files can be served by URL.
