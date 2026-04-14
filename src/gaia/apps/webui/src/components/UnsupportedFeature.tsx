@@ -38,7 +38,7 @@ const UNSUPPORTED_FILE_CATEGORIES: FileTypeCategory[] = [
         message: 'Video files are not supported for indexing.',
         alternatives: [
             'Extract subtitles or transcripts from videos and index those',
-            'Use GAIA\'s voice/talk mode for audio: gaia talk',
+            'Use the voice button (🎙️) in the chat input to speak with GAIA directly',
         ],
         featureTitle: 'Support video file indexing',
     },
@@ -47,7 +47,7 @@ const UNSUPPORTED_FILE_CATEGORIES: FileTypeCategory[] = [
         extensions: new Set(['.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus']),
         message: 'Audio files are not supported for indexing.',
         alternatives: [
-            'Use GAIA\'s voice mode for speech interaction: gaia talk',
+            'Use the voice button (🎙️) in the chat input for real-time speech interaction',
             'Transcribe audio to text first, then index the transcript',
         ],
         featureTitle: 'Support audio file transcription and indexing',

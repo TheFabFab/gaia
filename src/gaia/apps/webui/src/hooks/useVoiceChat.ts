@@ -54,8 +54,13 @@ export interface UseVoiceChatResult {
      * @param model - Optional ASR model name override.
      */
     start: (sessionId: string, model?: string) => void;
-    /** Sends a `stop` message and closes the WebSocket cleanly. */
+    /** Sends a `stop` message to end the current ASR turn. The WebSocket stays open. */
     stop: () => void;
+    /**
+     * Closes the WebSocket entirely without triggering a reconnect.
+     * Use on unmount or when voice mode is fully disabled.
+     */
+    disconnect: () => void;
     /**
      * Forwards a raw PCM ArrayBuffer to the server as a binary WebSocket frame.
      *
@@ -250,12 +255,24 @@ export function useVoiceChat(options: UseVoiceChatOptions): UseVoiceChatResult {
     }, []);
 
     /**
-     * Sends a `stop` message and closes the WebSocket without triggering
-     * a reconnect attempt.
+     * Sends a `stop` message to end the current ASR turn and trigger
+     * LLM + TTS processing. The WebSocket remains open so the client
+     * can receive the transcript / response / TTS messages and start
+     * another recording turn without reconnecting.
+     *
+     * To close the WebSocket entirely (e.g. on unmount) the component
+     * should call `disconnect()` instead.
      */
     const stop = useCallback(() => {
-        intentionalCloseRef.current = true;
         wsRef.current?.send(JSON.stringify({ type: 'stop' }));
+    }, []);
+
+    /**
+     * Closes the WebSocket without triggering a reconnect attempt.
+     * Call this on component unmount or when voice mode is fully disabled.
+     */
+    const disconnect = useCallback(() => {
+        intentionalCloseRef.current = true;
         wsRef.current?.close();
     }, []);
 
@@ -277,5 +294,5 @@ export function useVoiceChat(options: UseVoiceChatOptions): UseVoiceChatResult {
         wsRef.current?.send(JSON.stringify({ type: 'interrupt' }));
     }, [audioPlayback]);
 
-    return { capabilities, isConnected, start, stop, sendAudio, interrupt, error };
+    return { capabilities, isConnected, start, stop, disconnect, sendAudio, interrupt, error };
 }

@@ -13,6 +13,13 @@ import { getSessionHash } from '../utils/format';
 import { bugReportUrl } from './UnsupportedFeature';
 import type { Message, StreamEvent, AgentStep, Attachment, Session } from '../types';
 import './ChatView.css';
+import { VoiceButton } from './VoiceButton';
+import { VoiceActivityIndicator } from './VoiceActivityIndicator';
+import { AudioVisualizer } from './AudioVisualizer';
+import { useVoiceChat } from '../hooks/useVoiceChat';
+import { useAudioCapture } from '../hooks/useAudioCapture';
+import { fetchVoiceStatus } from '../services/voiceApi';
+import type { VoiceStatusResponse } from '../services/voiceApi';
 
 /** Cache for getComputedStyle results — avoids repeated style recalculations
  *  for the same textarea element since its styles rarely change. */
@@ -201,6 +208,56 @@ export function ChatView({ sessionId, onCreateAgent, onAgentChange }: ChatViewPr
     const sessionAgentName = agents.find((a) => a.id === session?.agent_type)?.name;
     const activeAgentName = agents.find((a) => a.id === activeAgentId)?.name;
 
+    // ── Voice mode ──────────────────────────────────────────────────────
+    // voiceState: idle → listening → processing → playing → idle
+    const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'processing' | 'playing'>('idle');
+    // Persisted voice-mode preference (restored from localStorage on mount)
+    const [voiceEnabled, setVoiceEnabled] = useState<boolean>(() => {
+        try { return localStorage.getItem('voice-mode-enabled') === 'true'; }
+        catch { return false; }
+    });
+    // ASR/TTS capability status fetched from /api/voice/status
+    const [voiceCapabilities, setVoiceCapabilities] = useState<VoiceStatusResponse | null>(null);
+    // Stable ref so useAudioCapture's onAudioData can call the latest sendAudio
+    // without creating a new closure on every render.
+    const sendAudioRef = useRef<((buffer: ArrayBuffer) => void) | null>(null);
+
+    // Voice WebSocket hook — connects immediately on mount.
+    const voiceChat = useVoiceChat({
+        onTranscript: useCallback((text: string) => {
+            addMessage({
+                id: Date.now(),
+                session_id: sessionId,
+                role: 'user',
+                content: `🎙️ ${text}`,
+                created_at: new Date().toISOString(),
+                rag_sources: null,
+            });
+            setVoiceState('processing');
+        }, [addMessage, sessionId]),
+        onResponse: useCallback((text: string) => {
+            addMessage({
+                id: Date.now() + 1,
+                session_id: sessionId,
+                role: 'assistant',
+                content: text,
+                created_at: new Date().toISOString(),
+                rag_sources: null,
+            });
+        }, [addMessage, sessionId]),
+        onTtsStart: useCallback(() => setVoiceState('playing'), []),
+        onTtsEnd: useCallback(() => setVoiceState('idle'), []),
+    });
+    // Keep sendAudioRef up to date so the audio capture callback is always current.
+    sendAudioRef.current = voiceChat.sendAudio;
+
+    // Microphone capture hook — forwards PCM chunks to the voice WebSocket.
+    const audioCapture = useAudioCapture({
+        onAudioData: useCallback((chunk: Float32Array) => {
+            sendAudioRef.current?.(chunk.buffer as ArrayBuffer);
+        }, []),
+    });
+
     // Close agent picker on outside click
     useEffect(() => {
         if (!agentPickerOpen) return;
@@ -237,6 +294,20 @@ export function ChatView({ sessionId, onCreateAgent, onAgentChange }: ChatViewPr
     const lastStreamContentRef = useRef('');
     const lastAgentStepsRef = useRef<AgentStep[]>([]);
     const prevStreamingRef = useRef(false);
+
+    // Fetch voice capability status on mount (once)
+    useEffect(() => {
+        fetchVoiceStatus()
+            .then(setVoiceCapabilities)
+            .catch(() => { /* voice unavailable — capabilities stay null */ });
+    }, []);
+
+    // Disconnect voice WebSocket on unmount / session change
+    useEffect(() => {
+        return () => {
+            voiceChat.disconnect();
+        };
+    }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
     // Continuously snapshot the streaming state so we have it when streaming ends
     useEffect(() => {
         if (streamingContent) lastStreamContentRef.current = streamingContent;
@@ -1115,6 +1186,31 @@ export function ChatView({ sessionId, onCreateAgent, onAgentChange }: ChatViewPr
         }
     };
 
+    /** Toggle voice recording — starts mic capture + ASR or stops current turn. */
+    const handleVoiceToggle = useCallback(async () => {
+        if (voiceState === 'idle') {
+            // Persist voice mode preference on first use
+            if (!voiceEnabled) {
+                setVoiceEnabled(true);
+                try { localStorage.setItem('voice-mode-enabled', 'true'); } catch { /* ignore */ }
+            }
+            try {
+                await audioCapture.start();
+                voiceChat.start(sessionId);
+                setVoiceState('listening');
+            } catch {
+                setVoiceState('idle');
+            }
+        } else if (voiceState === 'listening') {
+            audioCapture.stop();
+            voiceChat.stop();
+            setVoiceState('processing');
+        } else if (voiceState === 'playing') {
+            voiceChat.interrupt();
+            setVoiceState('idle');
+        }
+    }, [voiceState, voiceEnabled, audioCapture, voiceChat, sessionId]);
+
     // Session hash link copy
     const [hashCopied, setHashCopied] = useState(false);
     const handleCopyHash = useCallback((e: React.MouseEvent) => {
@@ -1474,6 +1570,10 @@ export function ChatView({ sessionId, onCreateAgent, onAgentChange }: ChatViewPr
                 </div>
             )}
 
+            {/* Voice activity indicators */}
+            <VoiceActivityIndicator active={voiceState === 'listening'} />
+            <AudioVisualizer isPlaying={voiceState === 'playing'} audioLevel={0.5} />
+
             {/* Input */}
             <div className="input-area">
                 <div
@@ -1542,6 +1642,12 @@ export function ChatView({ sessionId, onCreateAgent, onAgentChange }: ChatViewPr
                         <button className="btn-icon-sm" onClick={() => setShowFileBrowser(true)} title="Browse files" aria-label="Browse files">
                             <FolderSearch size={15} />
                         </button>
+                        <VoiceButton
+                            isRecording={voiceState === 'listening'}
+                            isProcessing={voiceState === 'processing'}
+                            voiceAvailable={voiceCapabilities?.asr.available ?? false}
+                            onToggle={handleVoiceToggle}
+                        />
                         {isStreaming ? (
                             <button
                                 className="stop-btn"
